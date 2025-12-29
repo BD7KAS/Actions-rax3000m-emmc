@@ -1,17 +1,10 @@
-#
-# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-# Description: Build OpenWrt using GitHub Actions
-#
-
 name: Build ImmortalWrt-mt798x
 
-permissions: write-all
-# 开启写权限，防止无法上传到release
+# 正确的权限设置
+permissions:
+  contents: write
+  actions: write
+  packages: write
 
 on:
   workflow_dispatch:
@@ -34,188 +27,193 @@ on:
 
 env:
   REPO_URL: https://github.com/hanwckf/immortalwrt-mt798x
-  FREE_DISK_SH: scripts/free_disk_space.sh
-  ENV_SH: scripts/environment.sh
-  DIY_SH: scripts/diy.sh
-  CLASH_CORE: scripts/preset-clash-core.sh
+  TZ: Asia/Shanghai
+  # 添加设备标识
+  DEVICE_NAME: mt7981-cmcc-rax3000m-emmc
   UPLOAD_BIN_DIR: false
   UPLOAD_FIRMWARE: false
   UPLOAD_RELEASE: true
-  TZ: Asia/Shanghai
 
 jobs:
   build:
     runs-on: ubuntu-22.04
 
     steps:
-    - name: 检查
-      uses: actions/checkout@main
+    - name: 检出仓库代码
+      uses: actions/checkout@v4
+      with:
+        path: source
 
-    - name: 初始化环境
-      env:
-        DEBIAN_FRONTEND: noninteractive
+    - name: 初始化环境变量
       run: |
         echo "USE_MTWIFI_CFG=${{ github.event.inputs.USE_MTWIFI_CFG }}" >> $GITHUB_ENV
         echo "USE_NX30PRO_EEPROM=${{ github.event.inputs.USE_NX30PRO_EEPROM }}" >> $GITHUB_ENV
         echo "USE_52MHZ=${{ github.event.inputs.USE_52MHZ }}" >> $GITHUB_ENV
-        chmod +x $FREE_DISK_SH && $FREE_DISK_SH
+        echo "FILE_DATE=$(date +%Y%m%d_%H%M)" >> $GITHUB_ENV
+
+    - name: 设置构建环境
+      run: |
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-        sudo -E apt-get -qq update -y
-        sudo -E apt-get -qq full-upgrade -y
-        chmod +x $ENV_SH && $ENV_SH
-        sudo timedatectl set-timezone "$TZ"
-        sudo mkdir -p /workdir
-        sudo chown $USER:$GROUPS /workdir
+        sudo apt-get update -y
+        sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib \
+          g++-multilib gettext git libncurses5-dev libssl-dev python3 python3-pip \
+          python3-venv python3-setuptools rsync unzip zlib1g-dev file wget
 
-    - name: 检查空间使用情况
-      if: (!cancelled())
-      run: df -hT
+    - name: 检查磁盘空间
+      run: df -h
 
-    - name: 克隆源码
-      working-directory: /workdir
+    - name: 克隆 ImmortalWrt 源码
+      working-directory: /tmp
       run: |
         git clone $REPO_URL openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        ln -sf /tmp/openwrt $GITHUB_WORKSPACE/openwrt
 
-    - name: 开启缓存
-      uses: klever1988/cachewrtbuild@main
+    - name: 设置 ccache 缓存
+      uses: actions/cache@v3
       with:
-        ccache: 'true'
-        mixkey: 'openwrt21-cortexa53'
-        prefix: ${{ github.workspace }}/openwrt
+        path: /tmp/openwrt/ccache
+        key: ${{ runner.os }}-openwrt-ccache-${{ hashFiles('**/.config') }}
+        restore-keys: |
+          ${{ runner.os }}-openwrt-ccache-
 
-    - name: 更新 & 安装 feeds & 执行脚本
+    - name: 更新 feeds 和配置
       run: |
-        cd openwrt
-        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git config --global user.name "github-actions[bot]"
-        #git fetch https://github.com/padavanonly/immortalwrt-mt798x
-        #git merge FETCH_HEAD
-        ./scripts/feeds update -a && ./scripts/feeds install -a        
-        chmod +x $GITHUB_WORKSPACE/$DIY_SH && $GITHUB_WORKSPACE/$DIY_SH
+        cd /tmp/openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        
+        # 复制自定义配置
+        if [ -d "$GITHUB_WORKSPACE/source/files" ]; then
+          cp -r $GITHUB_WORKSPACE/source/files /tmp/openwrt/
+        fi
+        
+        if [ -f "$GITHUB_WORKSPACE/source/.config" ]; then
+          cp $GITHUB_WORKSPACE/source/.config /tmp/openwrt/
+        fi
 
-    - name: 导入补丁和配置
+    - name: 应用自定义补丁和配置
+      working-directory: /tmp/openwrt
       run: |
-        [ -e files ] && mv files openwrt/files
-        cat configs/rax3000m-emmc_mtksdk.config >> openwrt/.config
+        # 添加默认配置
+        echo "CONFIG_TARGET_mediatek=y" >> .config
+        echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
+        echo "CONFIG_TARGET_mediatek_filogic_7981=y" >> .config
+        echo "CONFIG_TARGET_mediatek_filogic_7981_DEVICE_cmcc_rax3000m-emmc=y" >> .config
+        
+        # 应用配置片段
+        if [ -f "$GITHUB_WORKSPACE/source/configs/rax3000m-emmc_mtksdk.config" ]; then
+          cat $GITHUB_WORKSPACE/source/configs/rax3000m-emmc_mtksdk.config >> .config
+        fi
 
-    - name: 设置无线控制界面样式
+    - name: 配置无线界面（mtwifi-cfg）
       if: env.USE_MTWIFI_CFG == 'true'
+      working-directory: /tmp/openwrt
       run: |
-        sed -i '/CONFIG_PACKAGE_luci-app-mtk=y/{N;N;N;s/CONFIG_PACKAGE_luci-app-mtk=y\nCONFIG_PACKAGE_luci-i18n-mtk-zh-cn=y\nCONFIG_PACKAGE_wifi-profile=y\nCONFIG_WIFI_NORMAL_SETTING=y/CONFIG_PACKAGE_lua-cjson=y\nCONFIG_PACKAGE_luci-app-mtwifi-cfg=y\nCONFIG_PACKAGE_luci-i18n-mtwifi-cfg-zh-cn=y\nCONFIG_PACKAGE_mtwifi-cfg=y/}' openwrt/.config
+        sed -i 's/CONFIG_PACKAGE_luci-app-mtk=y/# CONFIG_PACKAGE_luci-app-mtk is not set/' .config
+        sed -i 's/CONFIG_PACKAGE_luci-i18n-mtk-zh-cn=y/# CONFIG_PACKAGE_luci-i18n-mtk-zh-cn is not set/' .config
+        echo "CONFIG_PACKAGE_luci-app-mtwifi-cfg=y" >> .config
+        echo "CONFIG_PACKAGE_luci-i18n-mtwifi-cfg-zh-cn=y" >> .config
+        echo "CONFIG_PACKAGE_mtwifi-cfg=y" >> .config
 
-    - name: 设置是否使用 nx30pro eeprom
+    - name: 配置 NX30 Pro EEPROM
       if: env.USE_NX30PRO_EEPROM == 'true'
       run: |
-        mkdir openwrt/target/linux/mediatek/mt7981/base-files/lib/firmware
-        cp eeprom/nx30pro_eeprom.bin openwrt/target/linux/mediatek/mt7981/base-files/lib/firmware/MT7981_iPAiLNA_EEPROM.bin
-        sed -i 's/caldata_extract_mmc/# caldata_extract_mmc/' openwrt/target/linux/mediatek/mt7981/base-files/lib/preinit/90_extract_caldata
-        sed -i 's#./files/mt7981-default-eeprom/MT7981_iPAiLNA_EEPROM.bin##' openwrt/package/mtk/drivers/mt_wifi/Makefile
+        mkdir -p /tmp/openwrt/target/linux/mediatek/mt7981/base-files/lib/firmware
+        if [ -f "$GITHUB_WORKSPACE/source/eeprom/nx30pro_eeprom.bin" ]; then
+          cp $GITHUB_WORKSPACE/source/eeprom/nx30pro_eeprom.bin \
+            /tmp/openwrt/target/linux/mediatek/mt7981/base-files/lib/firmware/MT7981_iPAiLNA_EEPROM.bin
+        fi
 
-    - name: 设置 dts 闪存频率
+    - name: 配置 eMMC 频率 (52MHz)
       if: env.USE_52MHZ == 'true'
+      working-directory: /tmp/openwrt
       run: |
-        sed -i -e '/bus-width = <8>;/ a\	cap-mmc-highspeed;' openwrt/target/linux/mediatek/files-5.4/arch/arm64/boot/dts/mediatek/mt7981-cmcc-rax3000m-emmc.dts
-        sed -i 's/26000000/52000000/g' openwrt/target/linux/mediatek/files-5.4/arch/arm64/boot/dts/mediatek/mt7981-cmcc-rax3000m-emmc.dts
-        grep max-frequency openwrt/target/linux/mediatek/files-5.4/arch/arm64/boot/dts/mediatek/mt7981-cmcc-rax3000m-emmc.dts
+        dts_file="target/linux/mediatek/files-5.4/arch/arm64/boot/dts/mediatek/mt7981-cmcc-rax3000m-emmc.dts"
+        if [ -f "$dts_file" ]; then
+          sed -i 's/max-frequency = <26000000>/max-frequency = <52000000>/' "$dts_file"
+        fi
 
-    - name: 下载文件
+    - name: 下载软件包
+      working-directory: /tmp/openwrt
       run: |
-        cd openwrt
-        chmod +x $GITHUB_WORKSPACE/$CLASH_CORE && $GITHUB_WORKSPACE/$CLASH_CORE
         make defconfig
-        make download -j8 V=10
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
+        make download -j$(nproc)
+        # 重新下载失败的文件
+        make download V=s 2>&1 | grep -i "failed\|error" || true
 
-    - name: 编译固件中
-      id: compile
+    - name: 编译固件
+      working-directory: /tmp/openwrt
+      timeout-minutes: 120
       run: |
-        cd openwrt
-        echo -e "$(($(nproc)+1)) thread compile"
-        make -j$(($(nproc)+1)) || make -j$(nproc) || make -j1 V=s
-        echo "status=success" >> $GITHUB_OUTPUT
-
-    - name: 空间使用情况
-      if: (!cancelled())
-      run: df -hT
-
-    - name: 上传 bin 目录
-      uses: actions/upload-artifact@main
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
-
-    - name: 整理文件
-      id: organize
-      if: steps.compile.outputs.status == 'success'
-      run: |
-        cd openwrt/bin/targets/*/*
-        rm -rf *.buildinfo 
-        rm -rf *.json 
-        rm -rf *.manifest 
-        rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
-
-    - name: 上传固件目录
-      uses: actions/upload-artifact@main
-      if: env.UPLOAD_FIRMWARE == 'true' && steps.organize.outputs.status == 'success' && !cancelled()
-      with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
-
-    - name: 生成发布标签
-      id: tag
-      if: env.UPLOAD_RELEASE == 'true' && steps.compile.outputs.status == 'success' && !cancelled()
-      run: |
-        echo -e "### immortalwrt-mt7981-cmcc_rax3000m-emmc" >> release.txt
-        wlan_luci_interface=""
-        if grep -q 'CONFIG_PACKAGE_mtwifi-cfg=y' openwrt/.config; then
-          echo "- 使用 OpenWrt 原生无线控制界面" >> release.txt
-          wlan_luci_interface="mtwifi-cfg"
+        echo "开始编译，使用 $(nproc) 个核心"
+        make -j$(nproc) V=s 2>&1 | tee build.log
+        
+        # 检查编译结果
+        if [ $? -eq 0 ] && [ -d bin/targets/mediatek/filogic ]; then
+          echo "编译成功"
+          echo "COMPILE_STATUS=success" >> $GITHUB_ENV
         else
-          echo "- 使用 MTK SDK 无线控制界面" >> release.txt
-          wlan_luci_interface="luci-app-mtk"
+          echo "编译失败"
+          echo "COMPILE_STATUS=failed" >> $GITHUB_ENV
+          exit 1
         fi
-        eeprom_status=""
-        if [ -e openwrt/target/linux/mediatek/mt7981/base-files/lib/firmware/MT7981_iPAiLNA_EEPROM.bin ] ; then
-          echo "- eeprom 使用 H3C NX30 Pro 提取版本" >> release.txt
-          eeprom_status="nx30pro_eeprom"
-        else
-          echo "- eeprom 未修改" >> release.txt
-          eeprom_status="default_eeprom"
-        fi
-        max_frequency=$(($(grep -oP "max-frequency = <\K[0-9]*" openwrt/target/linux/mediatek/files-5.4/arch/arm64/boot/dts/mediatek/mt7981-cmcc-rax3000m-emmc.dts) / 1000000))
-        echo "- 使用闪存频率: ${max_frequency}MHz" >> release.txt
-        release_tag=$(date +"%Y.%m.%d-mt7981-cmcc_rax3000m-emmc-${wlan_luci_interface}-${eeprom_status}-${max_frequency}MHz")
-        echo "release_tag=${release_tag}" >> $GITHUB_OUTPUT
-        echo "status=success" >> $GITHUB_OUTPUT
 
-    - name: 上传固件发布
+    - name: 准备发布文件
+      if: env.COMPILE_STATUS == 'success'
+      run: |
+        # 查找固件文件
+        FIRMWARE_DIR=$(find /tmp/openwrt/bin/targets -type d -name "*7981*" | head -1)
+        echo "FIRMWARE_DIR=$FIRMWARE_DIR" >> $GITHUB_ENV
+        
+        # 复制固件到工作空间
+        mkdir -p $GITHUB_WORKSPACE/firmware
+        cp $FIRMWARE_DIR/*.bin $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
+        cp $FIRMWARE_DIR/*.img $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
+        cp $FIRMWARE_DIR/*.gz $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
+
+    - name: 创建发布说明
+      if: env.COMPILE_STATUS == 'success'
+      run: |
+        cat > $GITHUB_WORKSPACE/release.md << EOF
+        # ImmortalWrt for CMCC RAX3000M (eMMC版本)
+        
+        ## 构建信息
+        - 设备：CMCC RAX3000M (eMMC)
+        - 芯片：MediaTek MT7981
+        - 无线界面：${{ env.USE_MTWIFI_CFG == 'true' && 'mtwifi-cfg' || 'MTK SDK' }}
+        - EEPROM：${{ env.USE_NX30PRO_EEPROM == 'true' && 'NX30 Pro 提取' || '默认' }}
+        - eMMC频率：${{ env.USE_52MHZ == 'true' && '52MHz' || '26MHz' }}
+        - 构建时间：$(date)
+        
+        ## 包含的软件包
+        - 基础系统：ImmortalWrt
+        - 管理界面：LuCI
+        - 无线驱动：mtwifi
+        
+        ## 刷机说明
+        1. 进入原厂系统uboot
+        2. 选择对应的固件文件刷入
+        3. 等待重启完成
+        EOF
+
+    - name: 上传固件到 Release
+      if: env.COMPILE_STATUS == 'success' && env.UPLOAD_RELEASE == 'true'
       uses: softprops/action-gh-release@v1
-      if: steps.tag.outputs.status == 'success' && !cancelled()
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
-        body_path: release.txt
-        files: ${{ env.FIRMWARE }}/*
+        tag_name: build-${{ env.DEVICE_NAME }}-${{ env.FILE_DATE }}
+        name: ImmortalWrt ${{ env.DEVICE_NAME }} ${{ env.FILE_DATE }}
+        body_path: $GITHUB_WORKSPACE/release.md
+        files: |
+          ${{ github.workspace }}/firmware/*.bin
+          ${{ github.workspace }}/firmware/*.img
+          ${{ github.workspace }}/firmware/*.gz
+        draft: false
+        prerelease: false
 
-    - name: 删除旧发布的固件
-      uses: dev-drprasad/delete-older-releases@v0.2.1
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 7
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: 删除过时工作流程
-      uses: Mattraks/delete-workflow-runs@v2
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        repository: ${{ github.repository }}
-        retain_days: 1
-        keep_minimum_runs: 3
+    - name: 清理工作空间
+      if: always()
+      run: |
+        sudo rm -rf /tmp/openwrt
+        rm -rf $GITHUB_WORKSPACE/openwrt
